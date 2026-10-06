@@ -75,6 +75,36 @@ class QuarantineRecord(Base):
     released_by = Column(String(64))
 
 
+class EquipmentFault(Base):
+    """冷库设备故障登记：编号唯一；登记字段固定，用于重复提交的幂等比对。"""
+
+    __tablename__ = "equipment_faults"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)
+    location = Column(String(128), nullable=False)
+    start_at = Column(DateTime(timezone=True), nullable=False)  # 故障开始（左闭）
+    end_at = Column(DateTime(timezone=True), nullable=False)    # 故障结束（右开）
+    reason = Column(String(256), nullable=False)
+    operator = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class FaultImpact(Base):
+    """故障影响清单：登记时一次性固定；重叠时段（左闭右开）即隔离依据。"""
+
+    __tablename__ = "fault_impacts"
+
+    id = Column(Integer, primary_key=True)
+    fault_id = Column(Integer, ForeignKey("equipment_faults.id"), nullable=False, index=True)
+    sample_id = Column(Integer, ForeignKey("samples.id"), nullable=False, index=True)
+    location = Column(String(128), nullable=False)  # 重叠时段内样品所在库位
+    overlap_start = Column(DateTime(timezone=True), nullable=False)
+    overlap_end = Column(DateTime(timezone=True), nullable=False)
+    already_quarantined = Column(Boolean, nullable=False, default=False)  # 登记时是否已隔离
+    quarantine_id = Column(Integer, ForeignKey("quarantine_records.id"))  # 关联的隔离记录
+
+
 class AuditLog(Base):
     """审计日志：所有状态变更的完整流水，可导出。"""
 

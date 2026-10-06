@@ -17,8 +17,9 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .database import Base, SessionLocal, engine, get_db
-from .models import (AuditLog, Handover, QuarantineRecord, ReadingCorrection,
-                     Sample, TemperatureReading)
+from .models import (AuditLog, EquipmentFault, FaultImpact, Handover,
+                     QuarantineRecord, ReadingCorrection, Sample,
+                     TemperatureReading)
 from .services import DomainError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +33,7 @@ EVENT_NAMES = {
     "READING_CORRECTED": "读数更正",
     "QUARANTINED": "样品隔离",
     "QUARANTINE_RELEASED": "隔离解除",
+    "FAULT_LINKED": "故障关联",
 }
 
 
@@ -145,11 +147,16 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
         select(AuditLog).where(AuditLog.sample_id == sample_id)
         .order_by(AuditLog.id.desc())).all()
     pending = next((h for h in handovers if h.status == "PENDING"), None)
+    fault_impacts = db.execute(
+        select(FaultImpact, EquipmentFault)
+        .join(EquipmentFault, EquipmentFault.id == FaultImpact.fault_id)
+        .where(FaultImpact.sample_id == sample_id)
+        .order_by(FaultImpact.id.desc())).all()
     return render(request, "sample_detail.html",
                   sample=sample, handovers=handovers, readings=readings,
                   corrections_by_reading=corrections_by_reading, effective=effective,
                   quarantines=quarantines, audits=audits, pending=pending,
-                  event_names=EVENT_NAMES)
+                  fault_impacts=fault_impacts, event_names=EVENT_NAMES)
 
 
 # ---------------------------------------------------------------- 操作
@@ -227,6 +234,66 @@ def release_quarantine(sample_id: int, reason: str = Form(...),
     except DomainError as e:
         return redirect(f"/samples/{sample_id}", e.message, "error")
     return redirect(f"/samples/{sample_id}", "隔离已解除，样品恢复在库状态")
+
+
+# ---------------------------------------------------------------- 设备故障
+
+@app.get("/faults", response_class=HTMLResponse)
+def faults(request: Request, db: Session = Depends(get_db)):
+    fault_list = db.scalars(
+        select(EquipmentFault).order_by(EquipmentFault.id.desc())).all()
+    impact_counts = dict(db.execute(
+        select(FaultImpact.fault_id, func.count()).group_by(FaultImpact.fault_id)
+    ).all())
+    return render(request, "faults.html", faults=fault_list,
+                  impact_counts=impact_counts)
+
+
+@app.get("/faults/new", response_class=HTMLResponse)
+def new_fault(request: Request):
+    return render(request, "fault_new.html")
+
+
+@app.post("/faults")
+def create_fault(code: str = Form(...), location: str = Form(...),
+                 start_at: str = Form(...), end_at: str = Form(...),
+                 reason: str = Form(...), operator: str = Form(...),
+                 db: Session = Depends(get_db)):
+    try:
+        start = services.parse_dt(start_at, "故障开始时间")
+        end = services.parse_dt(end_at, "故障结束时间")
+        fault, created = services.register_fault(
+            db, code, location, start, end, reason, operator)
+    except DomainError as e:
+        return redirect("/faults/new", e.message, "error")
+    except IntegrityError:
+        db.rollback()
+        return redirect("/faults/new", f"故障编号 {code} 已存在", "error")
+    if not created:
+        return redirect(f"/faults/{fault.id}",
+                        "相同编号及登记字段的故障已存在，返回原登记结果")
+    count = db.scalar(
+        select(func.count()).select_from(FaultImpact)
+        .where(FaultImpact.fault_id == fault.id))
+    if count:
+        return redirect(f"/faults/{fault.id}",
+                        f"故障登记完成：影响 {count} 条样品重叠时段，"
+                        "未隔离样品已隔离、其待确认交接已失效")
+    return redirect(f"/faults/{fault.id}",
+                    "故障登记完成：无受影响样品（已保存空清单）")
+
+
+@app.get("/faults/{fault_id}", response_class=HTMLResponse)
+def fault_detail(fault_id: int, request: Request, db: Session = Depends(get_db)):
+    fault = db.get(EquipmentFault, fault_id)
+    if fault is None:
+        return redirect("/faults", "故障记录不存在", "error")
+    impacts = db.execute(
+        select(FaultImpact, Sample)
+        .join(Sample, Sample.id == FaultImpact.sample_id)
+        .where(FaultImpact.fault_id == fault_id)
+        .order_by(FaultImpact.id)).all()
+    return render(request, "fault_detail.html", fault=fault, impacts=impacts)
 
 
 # ---------------------------------------------------------------- 导出

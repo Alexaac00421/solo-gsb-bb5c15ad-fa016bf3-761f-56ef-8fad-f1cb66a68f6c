@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}设备故障{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>设备故障登记</h2>
+    <a class="btn" href="/faults/new">+ 登记故障</a>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>故障编号</th><th>库位</th><th>故障时段（左闭右开）</th><th>原因</th>
+        <th>操作者</th><th>影响清单条数</th><th>登记时间</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for f in faults %}
+      <tr>
+        <td><a href="/faults/{{ f.id }}"><b>{{ f.code }}</b></a></td>
+        <td>{{ f.location }}</td>
+        <td>{{ f.start_at | dt }} ~ {{ f.end_at | dt }}</td>
+        <td>{{ f.reason }}</td>
+        <td>{{ f.operator }}</td>
+        <td>{{ impact_counts.get(f.id, 0) }}</td>
+        <td>{{ f.created_at | dt }}</td>
+        <td><a href="/faults/{{ f.id }}">详情</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">暂无故障登记，<a href="/faults/new">立即登记</a></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

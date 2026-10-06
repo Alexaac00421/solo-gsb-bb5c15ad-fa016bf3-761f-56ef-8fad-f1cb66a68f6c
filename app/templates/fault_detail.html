@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}故障 {{ fault.code }}{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <h2>故障 {{ fault.code }}</h2>
+    <a class="btn" href="/faults">返回故障列表</a>
+  </div>
+  <p class="meta">
+    库位：<b>{{ fault.location }}</b> ｜
+    故障时段（左闭右开）：<b>{{ fault.start_at | dt }} ~ {{ fault.end_at | dt }}</b><br>
+    原因：{{ fault.reason }} ｜ 操作者：{{ fault.operator }} ｜ 登记时间：{{ fault.created_at | dt }}
+  </p>
+</div>
+
+<div class="card">
+  <h3>影响清单（登记时一次性固定，共 {{ impacts | length }} 条）</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>样品</th><th>所在库位</th><th>重叠时段（左闭右开，隔离依据）</th>
+        <th>登记时状态</th><th>隔离记录</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for impact, sample in impacts %}
+      <tr>
+        <td><a href="/samples/{{ sample.id }}"><b>{{ sample.code }}</b></a></td>
+        <td>{{ impact.location }}</td>
+        <td>{{ impact.overlap_start | dt }} ~ {{ impact.overlap_end | dt }}</td>
+        <td>
+          {% if impact.already_quarantined %}<span class="badge bad">已隔离（仅关联）</span>
+          {% else %}<span class="badge pending">本次隔离</span>{% endif %}
+        </td>
+        <td>{% if impact.quarantine_id %}#{{ impact.quarantine_id }}{% else %}-{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">无受影响样品（空清单已保存）</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">解除隔离请在样品详情页走注明理由的复核流程。</p>
+</div>
+{% endblock %}

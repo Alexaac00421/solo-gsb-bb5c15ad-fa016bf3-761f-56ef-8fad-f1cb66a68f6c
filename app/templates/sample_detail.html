@@ -163,6 +163,30 @@
   </table>
 </div>
 
+{% if fault_impacts %}
+<div class="card">
+  <h3>关联设备故障</h3>
+  <table>
+    <thead>
+      <tr><th>故障编号</th><th>库位</th><th>重叠时段（左闭右开，隔离依据）</th><th>登记时状态</th></tr>
+    </thead>
+    <tbody>
+      {% for impact, fault in fault_impacts %}
+      <tr>
+        <td><a href="/faults/{{ fault.id }}"><b>{{ fault.code }}</b></a></td>
+        <td>{{ impact.location }}</td>
+        <td>{{ impact.overlap_start | dt }} ~ {{ impact.overlap_end | dt }}</td>
+        <td>
+          {% if impact.already_quarantined %}<span class="badge bad">已隔离（仅关联）</span>
+          {% else %}<span class="badge pending">本次隔离</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 <div class="card">
   <h3>审计时间线</h3>
   <ul class="timeline">
