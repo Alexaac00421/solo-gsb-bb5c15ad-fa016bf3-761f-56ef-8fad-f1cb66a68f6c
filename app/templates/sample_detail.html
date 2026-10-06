@@ -31,6 +31,38 @@
 </div>
 {% endif %}
 
+{% if failure_map %}
+<div class="card {{ 'warn' if sample.status == 'QUARANTINED' else '' }}">
+  <h3>关联设备故障（隔离依据）</h3>
+  <table>
+    <thead>
+      <tr><th>故障编号</th><th>库位</th><th>故障时段（左闭右开）</th><th>本样品重叠时段</th><th>登记时状态</th><th>操作者</th></tr>
+    </thead>
+    <tbody>
+      {% for fid, imps in impacts_by_failure.items() %}
+      {% set f = failure_map.get(fid) %}
+      {% if f %}
+      {% for imp in imps %}
+      <tr>
+        <td><a href="/failures/{{ f.id }}"><b>{{ f.code }}</b></a></td>
+        <td>{{ f.location }}</td>
+        <td>{{ f.start_time | dt }} ~ {{ f.end_time | dt }}</td>
+        <td>{{ imp.overlap_start | dt }} ~ {{ imp.overlap_end | dt }}</td>
+        <td>
+          {% if imp.was_quarantined %}<span class="badge bad">已隔离·仅关联</span>
+          {% else %}<span class="badge pending">未隔离·本次隔离</span>{% endif %}
+        </td>
+        <td>{{ f.operator }}</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">受影响清单在故障登记时一次性固定；解除隔离仍须使用上方「注明理由的复核结论」流程。</p>
+</div>
+{% endif %}
+
 <div class="grid">
   <div class="card">
     <h3>发起交接</h3>
@@ -140,13 +172,16 @@
   <h3>异常记录（隔离）</h3>
   <table>
     <thead>
-      <tr><th>ID</th><th>原因</th><th>状态</th><th>隔离时间</th><th>解除时间</th><th>复核结论</th><th>复核人</th></tr>
+      <tr><th>ID</th><th>原因 / 依据</th><th>状态</th><th>隔离时间</th><th>解除时间</th><th>复核结论</th><th>复核人</th></tr>
     </thead>
     <tbody>
       {% for q in quarantines %}
       <tr>
         <td>#{{ q.id }}</td>
-        <td>{{ q.reason }}</td>
+        <td>
+          {{ q.reason }}
+          {% if q.failure_id %}<div class="hint">隔离依据：<a href="/failures/{{ q.failure_id }}">设备故障 #{{ q.failure_id }}</a></div>{% endif %}
+        </td>
         <td>
           {% if q.status == 'ACTIVE' %}<span class="badge bad">隔离中</span>
           {% else %}<span class="badge ok">已解除</span>{% endif %}

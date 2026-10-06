@@ -12,13 +12,15 @@ class Sample(Base):
     temp_min = Column(Float, nullable=False)
     temp_max = Column(Float, nullable=False)
     current_location = Column(String(128), nullable=False)
+    # 登记位置：与已确认交接一起构成样品的位置时间线（旧库通过轻量迁移回填）
+    initial_location = Column(String(128), nullable=True)
     status = Column(String(16), nullable=False, default="ACTIVE")  # ACTIVE / QUARANTINED
     version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class Handover(Base):
-    """交接单：接收人确认前样品位置不变；越界隔离会使 PENDING 交接失效。"""
+    """交接单：接收人确认前样品位置不变；越界隔离/设备故障会使 PENDING 交接失效。"""
 
     __tablename__ = "handovers"
 
@@ -31,6 +33,8 @@ class Handover(Base):
     status = Column(String(16), nullable=False, default="PENDING")  # PENDING / CONFIRMED / INVALIDATED
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     decided_at = Column(DateTime(timezone=True))
+    # 因设备故障失效时记录来源故障，便于在故障页展示隔离依据
+    failure_id = Column(Integer, ForeignKey("equipment_failures.id"), nullable=True, index=True)
 
 
 class TemperatureReading(Base):
@@ -61,7 +65,7 @@ class ReadingCorrection(Base):
 
 
 class QuarantineRecord(Base):
-    """隔离记录：越界自动创建；仅能通过注明理由的复核结论解除。"""
+    """隔离记录：越界或设备故障时创建；仅能通过注明理由的复核结论解除。"""
 
     __tablename__ = "quarantine_records"
 
@@ -73,6 +77,40 @@ class QuarantineRecord(Base):
     released_at = Column(DateTime(timezone=True))
     release_reason = Column(String(256))
     released_by = Column(String(64))
+    # 因设备故障隔离时关联来源故障（隔离依据）；越界隔离为空
+    failure_id = Column(Integer, ForeignKey("equipment_failures.id"), nullable=True, index=True)
+
+
+class EquipmentFailure(Base):
+    """冷库设备故障登记：编号唯一；受影响样品清单一次性固定，不随后续状态变化。"""
+
+    __tablename__ = "equipment_failures"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(64), unique=True, nullable=False, index=True)  # 故障编号
+    location = Column(String(128), nullable=False)                     # 库位
+    start_time = Column(DateTime(timezone=True), nullable=False)       # 故障开始（左闭）
+    end_time = Column(DateTime(timezone=True), nullable=False)         # 故障结束（右开，<= 提交时刻）
+    reason = Column(String(256), nullable=False)                       # 故障原因
+    operator = Column(String(64), nullable=False)                      # 操作者
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class FailureImpact(Base):
+    """故障影响清单：登记时固定。同一样品与故障时段有多段位置重叠时逐段各存一行。"""
+
+    __tablename__ = "failure_impacts"
+
+    id = Column(Integer, primary_key=True)
+    failure_id = Column(Integer, ForeignKey("equipment_failures.id"),
+                        nullable=False, index=True)
+    sample_id = Column(Integer, ForeignKey("samples.id"), nullable=False, index=True)
+    overlap_start = Column(DateTime(timezone=True), nullable=False)  # 重叠起 [
+    overlap_end = Column(DateTime(timezone=True), nullable=False)    # 重叠止 )
+    segment_start = Column(DateTime(timezone=True), nullable=False)  # 该位置时段起
+    segment_end = Column(DateTime(timezone=True), nullable=True)     # 该位置时段止（在库至今为空）
+    was_quarantined = Column(Boolean, nullable=False, default=False)  # 登记时是否已隔离
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AuditLog(Base):

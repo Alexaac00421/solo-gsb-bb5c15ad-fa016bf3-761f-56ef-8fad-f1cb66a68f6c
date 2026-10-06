@@ -4,14 +4,23 @@
 - 样品状态变更前先 SELECT ... FOR UPDATE 锁定样品行，串行化互斥操作；
 - 交接确认、隔离解除使用条件 UPDATE（WHERE status=... / version=...），
   只有基于最新状态的操作才能生效，rowcount=0 即冲突，返回明确提示。
+- 设备故障登记会影响一批样品：在事务的第一步（取任何行锁之前）对相关表执行
+  LOCK TABLE ... IN EXCLUSIVE MODE（PostgreSQL）。EXCLUSIVE 与 ROW SHARE
+  （SELECT FOR UPDATE）和 ROW EXCLUSIVE（INSERT/UPDATE/DELETE）都互斥，
+  因此登记期间交接确认/录温/样品登记一律排队等其提交，且由于表锁先于行锁获取，
+  不会形成「对方持行锁等表锁、我方持表锁等行锁」的死锁；普通只读页面访问
+  （ACCESS SHARE）不受阻塞。SQLite 无表锁语法，依赖单写库锁（首次 INSERT 后
+  持有写锁）+ busy_timeout 等待。整段登记在单事务内原子提交，任何失败整体
+  回滚，不会留下部分清单或部分状态变更。
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
-from .models import (AuditLog, Handover, QuarantineRecord, ReadingCorrection,
-                     Sample, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
+                     QuarantineRecord, ReadingCorrection, Sample,
+                     TemperatureReading)
 
 
 class DomainError(Exception):
@@ -61,7 +70,8 @@ def register_sample(db: Session, code: str, temp_min: float, temp_max: float,
     if db.scalar(select(Sample).where(Sample.code == code)):
         raise ConflictError(f"样品编号 {code} 已存在")
     sample = Sample(code=code, temp_min=temp_min, temp_max=temp_max,
-                    current_location=location, status="ACTIVE", version=1)
+                    current_location=location, initial_location=location,
+                    status="ACTIVE", version=1)
     db.add(sample)
     db.flush()
     _audit(db, sample.id, "SAMPLE_REGISTERED", operator or "system", {
@@ -88,6 +98,17 @@ def create_handover(db: Session, sample_id: int, from_person: str, to_person: st
     )
     if pending:
         raise ConflictError("已存在待确认的交接，确认或失效前不能重复发起")
+    # 条件写入：仅当样品仍为 ACTIVE 时才落交接，防止与并发隔离
+    # （越界录温 / 设备故障登记）交错产生「隔离中仍挂着待确认交接」。
+    # PostgreSQL 下该路径已被故障登记的 EXCLUSIVE 表锁串行化，此条件为双保险。
+    res = db.execute(
+        update(Sample)
+        .where(Sample.id == sample_id, Sample.status == "ACTIVE")
+        .values(version=Sample.version + 1)
+    )
+    if res.rowcount == 0:
+        db.rollback()
+        raise ConflictError("样品刚被隔离，交接发起未生效，请刷新查看最新状态")
     handover = Handover(sample_id=sample_id, from_person=from_person,
                         to_person=to_person, destination=destination,
                         note=(note or "").strip(), status="PENDING")
@@ -229,3 +250,218 @@ def release_quarantine(db: Session, sample_id: int, reason: str,
     _audit(db, sample_id, "QUARANTINE_RELEASED", released_by, {
         "reason": reason, "quarantine_ids": [q.id for q in active]})
     db.commit()
+
+
+# ---------------------------------------------------------------- 设备故障
+
+def parse_dt(value: str, field: str) -> datetime:
+    """解析表单时间为带 UTC 时区的 datetime；支持 'Z' 后缀与不带时区的本地输入（按 UTC 处理）。"""
+    value = (value or "").strip()
+    if not value:
+        raise DomainError(f"{field}不能为空")
+    text_value = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    try:
+        dt = datetime.fromisoformat(text_value)
+    except ValueError:
+        raise DomainError(f"{field}时间格式无效，正确格式如 2026-10-06T14:30")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _dt_key(dt: datetime | None) -> str:
+    """时间字段的比较指纹：统一到 UTC 微秒精度字符串。"""
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _same_fields(existing: EquipmentFailure, location: str,
+                 start_time: datetime, end_time: datetime,
+                 reason: str, operator: str) -> bool:
+    """判断重复提交的登记字段是否与既有故障完全一致。"""
+    return (existing.location == location
+            and _dt_key(existing.start_time) == _dt_key(start_time)
+            and _dt_key(existing.end_time) == _dt_key(end_time)
+            and existing.reason == reason
+            and existing.operator == operator)
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # SQLite 取回的时间为无时区值，按 UTC 解释
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _position_segments(db: Session, sample: Sample) -> list[tuple[str, datetime, datetime | None]]:
+    """样品由「登记位置 + 已确认交接」形成的位置时间段（左闭右开）。
+
+    第 i 段：[第 i-1 个已确认交接的确认时刻, 第 i 个已确认交接的确认时刻)，
+    位置为第 i-1 个交接的目的地；首段从样品登记时刻开始、位于登记位置；
+    末段终点为 None，表示在库至今（右端正无穷）。
+    待确认、已失效交接均不改变位置，不参与时间线。
+    """
+    initial = sample.initial_location or sample.current_location
+    confirmed = db.scalars(
+        select(Handover)
+        .where(Handover.sample_id == sample.id, Handover.status == "CONFIRMED")
+        .order_by(Handover.decided_at.asc(), Handover.id.asc())
+    ).all()
+    segments: list[tuple[str, datetime, datetime | None]] = []
+    location = initial
+    seg_start = _as_utc(sample.created_at)
+    for h in confirmed:
+        decided = _as_utc(h.decided_at or h.created_at)
+        segments.append((location, seg_start, decided))
+        location = h.destination
+        seg_start = decided
+    segments.append((location, seg_start, None))
+    return segments
+
+
+def _lock_failure_tables(db: Session) -> None:
+    """PostgreSQL：登记开始时锁定涉及的表，与样品登记/交接确认/录温完全串行化。
+
+    EXCLUSIVE 与 ROW SHARE（SELECT ... FOR UPDATE）及 ROW EXCLUSIVE
+    （写操作）互斥，但与 ACCESS SHARE（普通 SELECT）兼容。必须在本事务获取
+    任何行锁之前调用，以避免与并发事务已持有的行锁形成死锁。
+    SQLite 无对应语法，靠单写库锁（首次 INSERT 后持有）+ busy_timeout，此处不处理。
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    db.execute(text(
+        "LOCK TABLE samples, handovers, temperature_readings, quarantine_records, "
+        "equipment_failures, failure_impacts, audit_logs IN EXCLUSIVE MODE"))
+
+
+def register_failure(db: Session, code: str, location: str,
+                     start_raw: str, end_raw: str, reason: str, operator: str
+                     ) -> tuple[EquipmentFailure, bool, list[FailureImpact]]:
+    """登记设备故障并一次性固定受影响样品清单。
+
+    返回 (故障, 是否新建, 影响清单)。相同编号且字段完全一致的重复提交返回原结果；
+    编号相同而字段不同抛 ConflictError（409）。任何失败整体回滚。
+    """
+    # ---- 1. 参数校验（失败不写任何数据）----
+    code = (code or "").strip()
+    location = (location or "").strip()
+    reason = (reason or "").strip()
+    operator = (operator or "").strip()
+    missing = [name for name, val in (("故障编号", code), ("库位", location),
+                                      ("故障原因", reason), ("操作者", operator)) if not val]
+    if missing:
+        raise DomainError("必填字段缺失：" + "、".join(missing))
+    start_time = parse_dt(start_raw, "故障开始时间")
+    end_time = parse_dt(end_raw, "故障结束时间")
+    if not start_time < end_time:
+        raise DomainError("起止时间无效：开始时间必须早于结束时间（时间段左闭右开）")
+    if end_time > _now():
+        raise DomainError("故障结束时间不得晚于提交时刻")
+
+    # ---- 2. 串行化：先锁表（PG），再查重；SQLite 靠单写库锁（首次写入后持有）----
+    _lock_failure_tables(db)
+    existing = db.scalar(select(EquipmentFailure).where(EquipmentFailure.code == code))
+    if existing is not None:
+        if not _same_fields(existing, location, start_time, end_time, reason, operator):
+            raise ConflictError(f"故障编号 {code} 已存在且登记字段不同，存在冲突；请核对后使用新编号")
+        impacts = db.scalars(
+            select(FailureImpact).where(FailureImpact.failure_id == existing.id)
+            .order_by(FailureImpact.id)).all()
+        return existing, False, impacts
+
+    failure = EquipmentFailure(code=code, location=location, start_time=start_time,
+                               end_time=end_time, reason=reason, operator=operator)
+    db.add(failure)
+    try:
+        db.flush()  # 触发唯一约束；SQLite 下同时取得写库锁
+    except Exception:
+        # 并发下编号可能已被其他事务占用：回滚后按幂等/冲突规则处理
+        db.rollback()
+        existing = db.scalar(select(EquipmentFailure).where(EquipmentFailure.code == code))
+        if existing is None:
+            raise DomainError("故障登记与其他提交并发冲突，请稍后重试")
+        if not _same_fields(existing, location, start_time, end_time, reason, operator):
+            raise ConflictError(f"故障编号 {code} 已存在且登记字段不同，存在冲突；请核对后使用新编号")
+        impacts = db.scalars(
+            select(FailureImpact).where(FailureImpact.failure_id == existing.id)
+            .order_by(FailureImpact.id)).all()
+        return existing, False, impacts
+
+    # ---- 3. 逐样品加行锁、基于最新状态计算与故障 [start,end) × 库位 的重叠 ----
+    samples = db.scalars(select(Sample).order_by(Sample.id)).all()
+    impacts: list[FailureImpact] = []
+    for s in samples:
+        sample = _lock_sample(db, s.id)  # FOR UPDATE：与交接确认/录温互斥
+        for seg_loc, seg_start, seg_end in _position_segments(db, sample):
+            if seg_loc != location:
+                continue
+            overlap_start = max(seg_start, start_time)
+            overlap_end = min(seg_end or end_time, end_time)
+            # 左闭右开：overlap_start < overlap_end 才算有交集
+            if overlap_start >= overlap_end:
+                continue
+            was_quarantined = sample.status == "QUARANTINED"
+            impact = FailureImpact(
+                failure_id=failure.id, sample_id=sample.id,
+                overlap_start=overlap_start, overlap_end=overlap_end,
+                segment_start=seg_start, segment_end=seg_end,
+                was_quarantined=was_quarantined)
+            db.add(impact)
+            impacts.append(impact)
+            db.flush()
+            if was_quarantined:
+                # 已隔离样品只关联本故障：不重复生成有效隔离、不动待确认交接
+                _audit(db, sample.id, "FAULT_LINKED", operator, {
+                    "failure_id": failure.id, "failure_code": code,
+                    "overlap": [overlap_start.isoformat(), overlap_end.isoformat()],
+                    "note": "登记时样品已隔离，仅关联故障，不重复隔离"})
+                continue
+
+    # ---- 4. 对本次清单中登记时未隔离的样品：隔离并使其待确认交接失效 ----
+    # 行锁在第 3 步已按 id 顺序获取并在本事务内保持，这里直接基于最新状态处理。
+    affected_sample_ids = sorted({imp.sample_id for imp in impacts})
+    for sid in affected_sample_ids:
+        sample = db.get(Sample, sid)
+        if sample.status == "QUARANTINED":
+            continue  # 登记时已隔离（was_quarantined=True 的段），只关联
+        sample.status = "QUARANTINED"
+        sample.version += 1
+        pending = db.scalars(
+            select(Handover).where(Handover.sample_id == sid, Handover.status == "PENDING")
+        ).all()
+        invalidated_ids: list[int] = []
+        for h in pending:
+            h.status = "INVALIDATED"
+            h.decided_at = _now()
+            h.failure_id = failure.id
+            invalidated_ids.append(h.id)
+        quarantine = QuarantineRecord(
+            sample_id=sid, failure_id=failure.id,
+            reason=f"设备故障 {code}：{location} 于 "
+                   f"{start_time.strftime('%Y-%m-%d %H:%M')}~"
+                   f"{end_time.strftime('%Y-%m-%d %H:%M')} 发生故障，"
+                   f"样品位置时段与故障时段重叠")
+        db.add(quarantine)
+        db.flush()
+        overlap = [(imp.overlap_start.isoformat(), imp.overlap_end.isoformat())
+                   for imp in impacts if imp.sample_id == sid]
+        _audit(db, sid, "QUARANTINED", operator, {
+            "failure_id": failure.id, "failure_code": code,
+            "quarantine_id": quarantine.id,
+            "invalidated_handovers": invalidated_ids,
+            "overlaps": overlap,
+            "reason": "设备故障登记：受影响样品隔离"})
+        for hid in invalidated_ids:
+            _audit(db, sid, "HANDOVER_INVALIDATED", operator, {
+                "handover_id": hid, "failure_id": failure.id,
+                "reason": f"设备故障 {code} 影响，样品隔离"})
+        _audit(db, sid, "FAULT_AFFECTED", operator, {
+            "failure_id": failure.id, "failure_code": code,
+            "overlaps": overlap, "quarantine_id": quarantine.id,
+            "invalidated_handovers": invalidated_ids})
+
+    # ---- 5. 原子提交；空清单同样保存（仅故障行，无影响行）----
+    db.commit()
+    return failure, True, impacts

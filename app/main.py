@@ -17,8 +17,9 @@ from sqlalchemy.orm import Session
 
 from . import services
 from .database import Base, SessionLocal, engine, get_db
-from .models import (AuditLog, Handover, QuarantineRecord, ReadingCorrection,
-                     Sample, TemperatureReading)
+from .models import (AuditLog, EquipmentFailure, FailureImpact, Handover,
+                     QuarantineRecord, ReadingCorrection, Sample,
+                     TemperatureReading)
 from .services import DomainError
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,18 +33,76 @@ EVENT_NAMES = {
     "READING_CORRECTED": "读数更正",
     "QUARANTINED": "样品隔离",
     "QUARANTINE_RELEASED": "隔离解除",
+    "FAULT_AFFECTED": "故障影响",
+    "FAULT_LINKED": "故障关联（已隔离）",
 }
 
 
 def init_db() -> None:
-    """初始化表结构，等待数据库就绪（Compose 一键启动时数据库可能仍在启动）。"""
+    """初始化表结构，等待数据库就绪（Compose 一键启动时数据库可能仍在启动）。
+
+    create_all 只建新表，不会给既有表加列；因此对旧版本库做一次轻量迁移：
+    补齐 samples.initial_location、handovers.failure_id、
+    quarantine_records.failure_id，并按登记审计回填初始位置。
+    """
     for _ in range(30):
         try:
             Base.metadata.create_all(bind=engine)
+            _migrate_schema()
             return
         except OperationalError:
             time.sleep(1)
     raise RuntimeError("无法连接数据库，初始化失败")
+
+
+def _migrate_schema() -> None:
+    """给既有库补齐本轮新增的可空列（幂等），并回填 samples.initial_location。"""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    statements: list[str] = []
+    if "samples" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("samples")}
+        if "initial_location" not in cols:
+            statements.append("ALTER TABLE samples ADD COLUMN initial_location VARCHAR(128)")
+    if "handovers" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("handovers")}
+        if "failure_id" not in cols:
+            statements.append("ALTER TABLE handovers ADD COLUMN failure_id INTEGER")
+    if "quarantine_records" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("quarantine_records")}
+        if "failure_id" not in cols:
+            statements.append("ALTER TABLE quarantine_records ADD COLUMN failure_id INTEGER")
+    if not statements:
+        return
+    db = SessionLocal()
+    try:
+        for stmt in statements:
+            db.execute(text(stmt))
+        # 回填初始位置：从 SAMPLE_REGISTERED 审计明细取登记位置，兜底用当前位置。
+        for sid, current_location in db.execute(
+                text("SELECT id, current_location FROM samples "
+                     "WHERE initial_location IS NULL")).all():
+            reg = db.execute(
+                text("SELECT detail FROM audit_logs WHERE sample_id = :sid "
+                     "AND event_type = 'SAMPLE_REGISTERED' ORDER BY id LIMIT 1"),
+                {"sid": sid}).first()
+            loc = None
+            if reg is not None:
+                detail = reg[0]
+                if isinstance(detail, str):  # 裸 SQL 读取时 JSON 列可能以文本返回
+                    try:
+                        detail = json.loads(detail)
+                    except (ValueError, TypeError):
+                        detail = None
+                if isinstance(detail, dict):
+                    loc = detail.get("location")
+            db.execute(text("UPDATE samples SET initial_location = :loc WHERE id = :sid"),
+                       {"loc": loc or current_location, "sid": sid})
+        db.commit()
+    finally:
+        db.close()
 
 
 def seed_demo() -> None:
@@ -85,10 +144,34 @@ templates.env.filters["dt"] = fmt_dt
 templates.env.filters["json_detail"] = lambda d: json.dumps(d or {}, ensure_ascii=False)
 
 
+def _minutes_between(pair) -> int:
+    """两个 datetime 之间的整分钟数（左闭右开区间时长）。"""
+    start, end = pair
+    if not start or not end:
+        return 0
+    return int((end - start).total_seconds() // 60)
+
+
+templates.env.filters["minutes_between"] = _minutes_between
+
+
 def render(request: Request, name: str, status_code: int = 200, **ctx):
     ctx.setdefault("msg", request.query_params.get("msg"))
     ctx.setdefault("level", request.query_params.get("level", "success"))
     return templates.TemplateResponse(request, name, ctx, status_code=status_code)
+
+
+def _is_lock_conflict(exc: OperationalError) -> bool:
+    """识别数据库死锁/锁等待失败（事务已被库回滚，提示用户重试即可）。"""
+    text_exc = str(exc.orig).lower()
+    markers = ("deadlock detected", "lock not available", "could not obtain lock",
+               "database is locked", "database table is locked")
+    return any(m in text_exc for m in markers)
+
+
+def lock_conflict_redirect(db: Session, url: str, where: str):
+    db.rollback()
+    return redirect(url, f"{where}与其他操作并发冲突，本次未生效（无部分变更），请刷新后重试", "error")
 
 
 def redirect(url: str, msg: str | None = None, level: str = "success") -> RedirectResponse:
@@ -114,6 +197,43 @@ def index(request: Request, db: Session = Depends(get_db)):
 @app.get("/samples/new", response_class=HTMLResponse)
 def new_sample(request: Request):
     return render(request, "new_sample.html")
+
+
+# ---------------------------------------------------------------- 设备故障页面
+
+@app.get("/failures", response_class=HTMLResponse)
+def failures(request: Request, db: Session = Depends(get_db)):
+    items = db.scalars(select(EquipmentFailure).order_by(EquipmentFailure.id.desc())).all()
+    counts = dict(db.execute(
+        select(FailureImpact.failure_id, func.count())
+        .group_by(FailureImpact.failure_id)).all())
+    return render(request, "failures.html", failures=items, counts=counts)
+
+
+@app.get("/failures/new", response_class=HTMLResponse)
+def new_failure(request: Request):
+    return render(request, "new_failure.html")
+
+
+@app.get("/failures/{failure_id}", response_class=HTMLResponse)
+def failure_detail(failure_id: int, request: Request, db: Session = Depends(get_db)):
+    failure = db.get(EquipmentFailure, failure_id)
+    if failure is None:
+        return redirect("/failures", "故障登记不存在", "error")
+    impacts = db.scalars(
+        select(FailureImpact).where(FailureImpact.failure_id == failure_id)
+        .order_by(FailureImpact.id)).all()
+    sample_map = {s.id: s for s in db.scalars(select(Sample)).all()}
+    # 隔离依据：本次故障直接产生的隔离记录与失效交接
+    quarantines = db.scalars(
+        select(QuarantineRecord).where(QuarantineRecord.failure_id == failure_id)
+        .order_by(QuarantineRecord.id)).all()
+    invalidated = db.scalars(
+        select(Handover).where(Handover.failure_id == failure_id)
+        .order_by(Handover.id)).all()
+    return render(request, "failure_detail.html", failure=failure, impacts=impacts,
+                  sample_map=sample_map, quarantines=quarantines,
+                  invalidated=invalidated)
 
 
 @app.get("/samples/{sample_id}", response_class=HTMLResponse)
@@ -144,11 +264,22 @@ def sample_detail(sample_id: int, request: Request, db: Session = Depends(get_db
     audits = db.scalars(
         select(AuditLog).where(AuditLog.sample_id == sample_id)
         .order_by(AuditLog.id.desc())).all()
+    # 该样品涉及的设备故障（按故障影响清单），用于展示隔离/关联依据
+    impact_rows = db.scalars(
+        select(FailureImpact).where(FailureImpact.sample_id == sample_id)
+        .order_by(FailureImpact.id)).all()
+    failure_ids = sorted({imp.failure_id for imp in impact_rows})
+    failure_map = {f.id: f for f in db.scalars(
+        select(EquipmentFailure).where(EquipmentFailure.id.in_(failure_ids))).all()} if failure_ids else {}
+    impacts_by_failure: dict[int, list] = {}
+    for imp in impact_rows:
+        impacts_by_failure.setdefault(imp.failure_id, []).append(imp)
     pending = next((h for h in handovers if h.status == "PENDING"), None)
     return render(request, "sample_detail.html",
                   sample=sample, handovers=handovers, readings=readings,
                   corrections_by_reading=corrections_by_reading, effective=effective,
                   quarantines=quarantines, audits=audits, pending=pending,
+                  failure_map=failure_map, impacts_by_failure=impacts_by_failure,
                   event_names=EVENT_NAMES)
 
 
@@ -177,6 +308,10 @@ def create_handover(sample_id: int, from_person: str = Form(...),
         services.create_handover(db, sample_id, from_person, to_person, destination, note)
     except DomainError as e:
         return redirect(f"/samples/{sample_id}", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}", "交接发起")
+        raise
     return redirect(f"/samples/{sample_id}", "交接已创建，等待接收人确认（确认前位置不变）")
 
 
@@ -188,6 +323,11 @@ def confirm_handover(handover_id: int, db: Session = Depends(get_db)):
         services.confirm_handover(db, handover_id)
     except DomainError as e:
         return redirect(f"/samples/{sample_id}" if sample_id else "/", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}" if sample_id else "/",
+                                          "交接确认")
+        raise
     return redirect(f"/samples/{sample_id}", "交接已确认，样品位置已更新")
 
 
@@ -198,6 +338,10 @@ def add_reading(sample_id: int, value: float = Form(...),
         _, out_of_range = services.record_temperature(db, sample_id, value, recorded_by)
     except DomainError as e:
         return redirect(f"/samples/{sample_id}", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}", "温度记录")
+        raise
     if out_of_range:
         return redirect(f"/samples/{sample_id}",
                         f"读数 {value}°C 越界：样品已立即隔离，待确认交接已失效", "error")
@@ -226,7 +370,37 @@ def release_quarantine(sample_id: int, reason: str = Form(...),
         services.release_quarantine(db, sample_id, reason, released_by, expected_version)
     except DomainError as e:
         return redirect(f"/samples/{sample_id}", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, f"/samples/{sample_id}", "解除隔离")
+        raise
     return redirect(f"/samples/{sample_id}", "隔离已解除，样品恢复在库状态")
+
+
+@app.post("/failures")
+def create_failure(code: str = Form(...), location: str = Form(...),
+                   start_time: str = Form(...), end_time: str = Form(...),
+                   reason: str = Form(...), operator: str = Form(...),
+                   db: Session = Depends(get_db)):
+    try:
+        failure, created, impacts = services.register_failure(
+            db, code, location, start_time, end_time, reason, operator)
+    except DomainError as e:
+        return redirect("/failures/new", e.message, "error")
+    except OperationalError as e:
+        if _is_lock_conflict(e):
+            return lock_conflict_redirect(db, "/failures/new", "故障登记")
+        raise
+    if not created:
+        return redirect(f"/failures/{failure.id}",
+                        f"故障编号 {failure.code} 已登记过，已返回原结果（受影响样品 {len(impacts)} 个，清单未变更）")
+    if impacts:
+        return redirect(f"/failures/{failure.id}",
+                        f"故障 {failure.code} 登记完成：固定受影响样品 {len(impacts)} 个，"
+                        "登记时未隔离的样品已隔离、其待确认交接已失效")
+    return redirect(f"/failures/{failure.id}",
+                    f"故障 {failure.code} 登记完成：无样品在该库位与故障时段重叠，已保存空影响清单",
+                    "success")
 
 
 # ---------------------------------------------------------------- 导出
